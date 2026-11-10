@@ -1,0 +1,15 @@
+services:
+  pocketbase:
+    build: .
+    image: nas-sync-pocketbase:0.40.6
+    container_name: pocketbase
+    restart: unless-stopped
+    # Only reachable from the NAS itself; Tailscale Serve publishes it to the tailnet over HTTPS.
+    ports:
+      - "127.0.0.1:8090:8090"
+    volumes:
+      - ./pb_data:/pb/pb_data
+      # Table definitions; applied automatically when the container starts.
+      - ./pb_migrations:/pb/pb_migrations
+    environment:
+      - TZ=America/Los_Angeles

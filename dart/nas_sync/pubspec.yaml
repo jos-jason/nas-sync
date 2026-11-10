@@ -1,0 +1,14 @@
+name: nas_sync
+description: Local-first sync of app data with the PocketBase server on the NAS. Newest change wins; the losing version is handed back to the app to keep.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.8.0
+
+dependencies:
+  http: ^1.6.0
+
+dev_dependencies:
+  test: ^1.25.0
+  lints: ^6.0.0
