@@ -19,6 +19,9 @@ class MemorySource extends SyncSource {
   final List<SyncItem> losers = [];
   Future<SyncItem?> Function(SyncItem local, SyncItem remote)? merger;
 
+  /// Which files to download (default: all).
+  bool Function(SyncItem item)? wants;
+
   @override
   Future<SyncItem?> read(String kind, String key) async => items['$kind/$key'];
 
@@ -36,6 +39,9 @@ class MemorySource extends SyncSource {
 
   @override
   Future<SyncItem?> merge(SyncItem local, SyncItem remote) async => merger?.call(local, remote);
+
+  @override
+  Future<bool> wantsBlob(SyncItem item) async => wants?.call(item) ?? true;
 }
 
 /// A fake clock shared by all devices in a test, so "newer" is exact.
@@ -257,5 +263,91 @@ void main() {
     final fresh = await c.refresh();
     expect(fresh.userId, saved['userId']);
     expect(fresh.email, 'alice@test.local');
+  });
+
+  group('files on demand', () {
+    final bytes = Uint8List.fromList(List.generate(5000, (i) => i % 7));
+
+    /// B downloads only files it already has.
+    Future<(Device, Device)> devices() async {
+      final a = await Device.signedIn(app, 'A', 'alice');
+      final b = await Device.signedIn(app, 'B', 'alice');
+      b.source.wants = (item) => b.source.items['doc/${item.key}']?.blob != null;
+      return (a, b);
+    }
+
+    test('an item can arrive without its file, which downloads later', () async {
+      final (a, b) = await devices();
+      await a.put('k1', {'name': 'Owl'}, blob: bytes);
+      await a.sync.sync();
+
+      expect((await b.sync.sync()).pulled, 1);
+      final pending = b.source.items['doc/k1']!;
+      expect(pending.data, {'name': 'Owl'});
+      expect(pending.blob, isNull);
+      expect(pending.blobPending, isTrue);
+
+      final got = await b.sync.download('doc', 'k1');
+      expect(got!.blob, bytes);
+      expect(b.source.items['doc/k1']!.blob, bytes);
+      expect(await b.sync.hasPending, isFalse);
+      // Nothing to pull again.
+      expect((await b.sync.sync()).pulled, 0);
+    });
+
+    test('once downloaded, later edits come with their files', () async {
+      final (a, b) = await devices();
+      await a.put('k1', {'v': 1}, blob: bytes);
+      await a.sync.sync();
+      await b.sync.sync();
+      await b.sync.download('doc', 'k1');
+
+      final edited = Uint8List.fromList([1, 2, 3]);
+      await a.put('k1', {'v': 2}, blob: edited);
+      await a.sync.sync();
+      await b.sync.sync();
+      expect(b.source.items['doc/k1']!.blob, edited);
+      expect(b.data('k1'), {'v': 2});
+    });
+
+    test('a download takes the newest version, even before a sync', () async {
+      final (a, b) = await devices();
+      await a.put('k1', {'v': 1}, blob: bytes);
+      await a.sync.sync();
+      await b.sync.sync();
+      await a.put('k1', {'v': 2}, blob: Uint8List.fromList([9]));
+      await a.sync.sync();
+
+      await b.sync.download('doc', 'k1');
+      expect(b.data('k1'), {'v': 2});
+      expect(b.source.items['doc/k1']!.blob, [9]);
+      expect((await b.sync.sync()).pulled, 0);
+    });
+
+    test('downloading something deleted elsewhere deletes it here', () async {
+      final (a, b) = await devices();
+      await a.put('k1', {'v': 1}, blob: bytes);
+      await a.sync.sync();
+      await b.sync.sync();
+      await a.remove('k1');
+      await a.sync.sync();
+
+      expect(await b.sync.download('doc', 'k1'), isNull);
+      expect(b.source.items['doc/k1'], isNull);
+    });
+
+    test('deleting an item never downloaded deletes it everywhere', () async {
+      final (a, b) = await devices();
+      await a.put('k1', {'v': 1}, blob: bytes);
+      await a.sync.sync();
+      await b.sync.sync();
+      await b.remove('k1');
+      expect(await b.sync.isPending('doc', 'k1'), isTrue);
+      await b.sync.sync();
+      expect(await b.sync.isPending('doc', 'k1'), isFalse);
+
+      await a.sync.sync();
+      expect(a.source.items['doc/k1'], isNull);
+    });
   });
 }

@@ -21,6 +21,11 @@ class SyncItem {
   /// Which device made this version (from the server; informational).
   final String? device;
 
+  /// The server has a file for this version that wasn't downloaded
+  /// (the app said no in [SyncSource.wantsBlob]); [blob] is null.
+  /// [NasSync.download] fetches it.
+  final bool blobPending;
+
   const SyncItem({
     required this.kind,
     required this.key,
@@ -29,12 +34,14 @@ class SyncItem {
     this.data,
     this.blob,
     this.device,
+    this.blobPending = false,
   });
 
   const SyncItem.deletion({required this.kind, required this.key, required this.modified, this.device})
       : deleted = true,
         data = null,
-        blob = null;
+        blob = null,
+        blobPending = false;
 }
 
 /// An item that exists on this device, for [NasSync.adopt].
@@ -58,6 +65,16 @@ abstract class SyncSource {
   /// Optionally combine two conflicting versions instead of newest-wins.
   /// Return null to use newest-wins. Never called with a deletion.
   Future<SyncItem?> merge(SyncItem local, SyncItem remote) async => null;
+
+  /// Whether to download the file of a version pulled from the server
+  /// ([item] has its data but no blob yet). Say no to keep only the
+  /// [SyncItem.data] (a name, a preview...) here: [apply] then gets the item
+  /// with [SyncItem.blobPending] set, and [NasSync.download] fetches the file
+  /// when it's wanted. Items changed here as well are always downloaded.
+  ///
+  /// Such an item must not be marked changed (other than deleted) until its
+  /// file is downloaded: [read] has no file to send for it.
+  Future<bool> wantsBlob(SyncItem item) async => true;
 }
 
 /// What a [NasSync.sync] did.
@@ -208,7 +225,7 @@ class NasSync {
       final st = s.items[id];
       if (!(st != null && st.recordId == r['id'] && st.baseUpdated == updated)) {
         if (st == null || !st.dirty) {
-          await _applyRemote(s, id, r, await _remoteItem(r, token));
+          await _applyRemote(s, id, r, await _remoteItem(r, token, ask: true));
           report.pulled++;
         } else {
           await _resolve(s, st, r, await _remoteItem(r, token));
@@ -224,20 +241,59 @@ class NasSync {
     if (unsaved > 0) await _save();
   }
 
-  Future<SyncItem> _remoteItem(Map<String, dynamic> r, Future<String> Function() token) async {
+  /// The server's version in [r]. With [ask], the file is downloaded only
+  /// if [SyncSource.wantsBlob] says so.
+  Future<SyncItem> _remoteItem(Map<String, dynamic> r, Future<String> Function() token, {bool ask = false}) async {
     final deleted = r['deleted'] as bool? ?? false;
     final file = r['blob'] as String? ?? '';
     final data = r['data'];
-    return SyncItem(
-      kind: r['kind'] as String,
-      key: r['item_key'] as String,
-      modified: (r['modified'] as num?)?.toInt() ?? 0,
-      deleted: deleted,
-      data: !deleted && data is Map ? data.cast<String, dynamic>() : null,
-      blob: !deleted && file.isNotEmpty ? await client.download(r['id'] as String, file, await token()) : null,
-      device: r['device'] as String?,
-    );
+    SyncItem item({Uint8List? blob, bool pending = false}) => SyncItem(
+          kind: r['kind'] as String,
+          key: r['item_key'] as String,
+          modified: (r['modified'] as num?)?.toInt() ?? 0,
+          deleted: deleted,
+          data: !deleted && data is Map ? data.cast<String, dynamic>() : null,
+          blob: blob,
+          device: r['device'] as String?,
+          blobPending: pending,
+        );
+    if (deleted || file.isEmpty) return item();
+    if (ask && !await source.wantsBlob(item(pending: true))) return item(pending: true);
+    return item(blob: await client.download(r['id'] as String, file, await token()));
   }
+
+  /// Downloads the file of an item pulled without it (see
+  /// [SyncSource.wantsBlob]) and hands the whole item to [SyncSource.apply].
+  /// Returns it, or null if it's no longer on the server (then the deletion
+  /// is applied). Takes the server's latest version, so call it any time.
+  Future<SyncItem?> download(String kind, String key) async {
+    if (client.auth == null) throw StateError('Not signed in');
+    final s = await _load();
+    final id = SyncState.id(kind, key);
+    final st = s.items[id];
+    final recordId = st?.recordId;
+    if (st == null || recordId == null) return null;
+    final r = await client.getRecord(recordId);
+    if (r == null) {
+      final gone = SyncItem.deletion(kind: kind, key: key, modified: st.modified);
+      await source.apply(gone);
+      s.items.remove(id);
+      await _save();
+      return null;
+    }
+    final item = await _remoteItem(r, client.fileToken);
+    // A newer version than the last pull: taking it here is the same as
+    // pulling it, unless this device changed the item meanwhile (then the
+    // next sync sorts it out as usual).
+    if (st.dirty) return item;
+    await _applyRemote(s, id, r, item);
+    await _save();
+    return item.deleted ? null : item;
+  }
+
+  /// Whether this device has changes to the item that haven't been sent yet.
+  Future<bool> isPending(String kind, String key) async =>
+      (await _load()).items[SyncState.id(kind, key)]?.dirty ?? false;
 
   /// Writes the server's version locally and remembers it as synced, unless
   /// the app changed the item while it was being written.

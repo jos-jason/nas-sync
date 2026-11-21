@@ -31,6 +31,10 @@ await sync.sync();                             // on start, after edits, every f
 ```
 `MySource` extends `SyncSource`: `read`, `apply`, and optionally `keepLoser` / `merge`.
 
+Big files can stay on the server until wanted: return false from `wantsBlob` and `apply` gets
+the item's `data` only (`blobPending` set), e.g. a name and a preview; `sync.download(kind, key)`
+fetches the file later. Inkpad uses this to show drawings from other devices as previews.
+
 ## Testing
 Run a local PocketBase with these migrations and users `alice`/`bob`
 (passwords `pw-<name>-12345`), then:
